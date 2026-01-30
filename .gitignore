@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+.eggs/
+
+# Debug / IDE
+.cursor/debug.log
+
+# Output (optional; remove if you want to track)
+# output/
+
+# OS
+.DS_Store
+Thumbs.db

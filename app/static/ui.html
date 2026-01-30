@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQ Intelligence Engine</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; background: #f5f5f5; }
+    h1 { font-size: 1.5rem; margin-top: 0; }
+    .card { background: #fff; border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
+    input[type="file"] { margin-bottom: 0.75rem; }
+    button { padding: 0.5rem 1rem; margin-right: 0.5rem; margin-bottom: 0.5rem; cursor: pointer; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 0.9rem; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    button.secondary { background: #64748b; }
+    button.secondary:hover { background: #475569; }
+    .status { margin-top: 0.75rem; padding: 0.5rem; background: #f0f9ff; border-radius: 6px; font-size: 0.9rem; }
+    .error { background: #fef2f2; color: #b91c1c; }
+    pre { background: #1e293b; color: #e2e8f0; padding: 1rem; border-radius: 6px; overflow: auto; max-height: 300px; font-size: 0.8rem; }
+    .actions { margin-top: 1rem; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>SQ Intelligence Engine</h1>
+    <p>Upload an SQ PDF, then view the table, download PPT, or generate SOW.</p>
+  </div>
+
+  <div class="card">
+    <label for="pdf">PDF file</label>
+    <input type="file" id="pdf" accept=".pdf">
+    <div class="actions">
+      <button type="button" id="parseBtn">Parse PDF</button>
+    </div>
+    <div id="parseStatus" class="status" style="display: none;"></div>
+  </div>
+
+  <div class="card" id="actionsCard" style="display: none;">
+    <label>After parsing</label>
+    <div class="actions">
+      <button type="button" id="viewTableBtn" class="secondary">View table (HTML)</button>
+      <button type="button" id="downloadPptBtn">Download PPT</button>
+      <button type="button" id="generateSowBtn" class="secondary">Generate SOW</button>
+    </div>
+    <div id="sowResult" style="display: none; margin-top: 1rem;">
+      <label>SOW result</label>
+      <pre id="sowPre"></pre>
+    </div>
+  </div>
+
+  <script>
+    const base = window.location.origin;
+    let parsedData = null;
+    const pdfInput = document.getElementById('pdf');
+    const parseBtn = document.getElementById('parseBtn');
+    const parseStatus = document.getElementById('parseStatus');
+    const actionsCard = document.getElementById('actionsCard');
+    const viewTableBtn = document.getElementById('viewTableBtn');
+    const downloadPptBtn = document.getElementById('downloadPptBtn');
+    const generateSowBtn = document.getElementById('generateSowBtn');
+    const sowResult = document.getElementById('sowResult');
+    const sowPre = document.getElementById('sowPre');
+
+    function showStatus(msg, isError) {
+      parseStatus.style.display = 'block';
+      parseStatus.textContent = msg;
+      parseStatus.classList.toggle('error', !!isError);
+    }
+
+    parseBtn.addEventListener('click', async () => {
+      const file = pdfInput.files[0];
+      if (!file) { showStatus('Please select a PDF file.', true); return; }
+      parseBtn.disabled = true;
+      showStatus('Parsing…');
+      try {
+        const form = new FormData();
+        form.append('file', file);
+        const res = await fetch(base + '/api/sq/parse', { method: 'POST', body: form });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.detail || res.statusText);
+        parsedData = json.data;
+        const n = (parsedData.products || []).length;
+        showStatus('Parsed: ' + n + ' products. Project: ' + (parsedData.project?.project_name || '—'));
+        actionsCard.style.display = 'block';
+      } catch (e) {
+        showStatus('Error: ' + e.message, true);
+        actionsCard.style.display = 'none';
+      }
+      parseBtn.disabled = false;
+    });
+
+    viewTableBtn.addEventListener('click', async () => {
+      const file = pdfInput.files[0];
+      if (!file) { alert('Please select a PDF file first.'); return; }
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch(base + '/api/sq/parse/html', { method: 'POST', body: form });
+      const html = await res.text();
+      const w = window.open('', '_blank');
+      w.document.write(html);
+      w.document.close();
+    });
+
+    downloadPptBtn.addEventListener('click', async () => {
+      if (!parsedData) { alert('Parse a PDF first.'); return; }
+      downloadPptBtn.disabled = true;
+      try {
+        const res = await fetch(base + '/api/ppt/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(parsedData)
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'sq_presentation.pptx';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+      downloadPptBtn.disabled = false;
+    });
+
+    generateSowBtn.addEventListener('click', async () => {
+      if (!parsedData) { alert('Parse a PDF first.'); return; }
+      generateSowBtn.disabled = true;
+      sowResult.style.display = 'none';
+      try {
+        const res = await fetch(base + '/api/sow/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(parsedData)
+        });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.detail || res.statusText);
+        sowPre.textContent = JSON.stringify(json, null, 2);
+        sowResult.style.display = 'block';
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+      generateSowBtn.disabled = false;
+    });
+  </script>
+</body>
+</html>

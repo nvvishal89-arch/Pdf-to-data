@@ -1,0 +1,13 @@
+# Phase 1 - SQ Intelligence Engine
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+openpyxl>=3.1.2
+pandas>=2.1.0
+pypdf>=4.0.0
+pdf2image>=1.17.0
+pytesseract>=0.3.10
+Pillow>=10.2.0
+xlsxwriter>=3.1.9
+pymupdf>=1.24.0
+python-pptx>=0.6.21

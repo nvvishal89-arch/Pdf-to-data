@@ -1,0 +1,55 @@
+{
+  "header_anchors": [
+    {
+      "label": "project name",
+      "key": "project_name",
+      "row": 10,
+      "col": 3,
+      "value_col": 4
+    },
+    {
+      "label": "date",
+      "key": "date",
+      "row": 10,
+      "col": 9,
+      "value_col": 10
+    },
+    {
+      "label": "name",
+      "key": "company_name",
+      "row": 12,
+      "col": 4,
+      "value_col": 5
+    }
+  ],
+  "table_header_row": 12,
+  "table_columns": [
+    {
+      "header": "s.no.",
+      "key": "sr_no",
+      "col_index": 3
+    },
+    {
+      "header": "area",
+      "key": "area",
+      "col_index": 5
+    },
+    {
+      "header": "refrence image",
+      "key": "images",
+      "col_index": 6
+    },
+    {
+      "header": "qty",
+      "key": "qty",
+      "col_index": 9
+    },
+    {
+      "header": "amount",
+      "key": "amount",
+      "col_index": 10
+    }
+  ],
+  "data_start_row": 13,
+  "raw_cells": {}
+}
