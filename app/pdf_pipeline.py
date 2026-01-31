@@ -324,10 +324,12 @@ def _parse_totals_from_text(text: str) -> dict[str, float]:
 def parse_pdf_to_structured_data(
     pdf_path: str | Path,
     config: Optional[TemplateConfig] = None,
+    use_vision_views: bool = False,
 ) -> SQStructuredData:
     """
     Parse SQ PDF into SQStructuredData.
     Uses config for column mapping if provided; otherwise uses heuristics from text.
+    When use_vision_views=True, classifies view per image (vision API) and sets Product.image_views.
     """
     text = extract_text_from_pdf(pdf_path)
     header = _parse_header_from_text(text)
@@ -351,10 +353,16 @@ def parse_pdf_to_structured_data(
     for i, row in enumerate(table_rows):
         img_idx = image_offset + i
         product_images = [extracted_images[img_idx]] if img_idx < len(extracted_images) else []
+        name = row.get("name", "")
+        if use_vision_views and product_images:
+            from app.image_ai import classify_view
+            image_views = [classify_view(name, img) for img in product_images]
+        else:
+            image_views = []
         products.append(
             Product(
                 sr_no=int(_safe_float(row.get("sr_no", 0))) or (i + 1),
-                name=row.get("name", ""),
+                name=name,
                 description=row.get("description", row.get("name", "")),
                 dimensions=row.get("dimensions", ""),
                 area=row.get("area", ""),
@@ -364,6 +372,7 @@ def parse_pdf_to_structured_data(
                 unit_price=_safe_float(row.get("unit_price", 0)),
                 amount=_safe_float(row.get("amount", 0)),
                 images=product_images,
+                image_views=image_views,
             )
         )
 
@@ -384,10 +393,11 @@ def parse_pdf_to_structured_data(
 def parse_pdf_with_validation(
     pdf_path: str | Path,
     config: Optional[TemplateConfig] = None,
+    use_vision_views: bool = False,
 ) -> tuple[SQStructuredData, list]:
     """Parse PDF and run validation; return (data, validation_errors)."""
     from app.schema import ValidationError
 
-    data = parse_pdf_to_structured_data(pdf_path, config)
+    data = parse_pdf_to_structured_data(pdf_path, config, use_vision_views=use_vision_views)
     errors = validate_sq_data(data)
     return data, errors

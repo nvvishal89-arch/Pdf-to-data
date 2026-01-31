@@ -1,8 +1,12 @@
 """
 Phase 3: Auto PPT Generator (spec §9).
 Slides: Project Summary → Product Overview → Product Renders → Technical Drawings → Lifecycle → Delivery.
+Optional product_drawings: list of dicts with product_index, name, png_base64 for Technical Drawings slide(s).
 """
+import base64
 from io import BytesIO
+from typing import Optional
+
 from pptx import Presentation
 from pptx.util import Inches, Pt
 
@@ -56,8 +60,6 @@ def _add_product_slide(prs: Presentation, product, index: int, total: int) -> No
     # Optional: add first product image if base64 available
     if product.images:
         try:
-            import base64
-            from pptx.util import Emu
             img_data = base64.b64decode(product.images[0])
             pic = slide.shapes.add_picture(
                 BytesIO(img_data), Inches(0.5), Inches(2.8), width=Inches(2.5)
@@ -66,7 +68,25 @@ def _add_product_slide(prs: Presentation, product, index: int, total: int) -> No
             pass
 
 
-def generate_ppt(data: SQStructuredData) -> bytes:
+def _add_drawing_slide(prs: Presentation, name: str, png_base64: str, index: int, total: int) -> None:
+    """One slide per product 2D drawing (PNG)."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9), Inches(0.6))
+    tb.text_frame.text = f"Technical Drawing {index + 1}/{total}: {name}"
+    for p in tb.text_frame.paragraphs:
+        p.font.size = Pt(20)
+        p.font.bold = True
+    try:
+        img_data = base64.b64decode(png_base64)
+        slide.shapes.add_picture(BytesIO(img_data), Inches(0.5), Inches(1), width=Inches(5))
+    except Exception:
+        pass
+
+
+def generate_ppt(
+    data: SQStructuredData,
+    product_drawings: Optional[list[dict]] = None,
+) -> bytes:
     """Generate PowerPoint from SQ structured data. Returns .pptx file bytes."""
     prs = Presentation()
     prs.slide_width = Inches(10)
@@ -87,8 +107,22 @@ def generate_ppt(data: SQStructuredData) -> bytes:
     # 3. Product Render Slides
     for i, p in enumerate(data.products):
         _add_product_slide(prs, p, i, len(data.products))
-    # 4. Technical Drawings (placeholder)
-    _add_content_slide(prs, "Technical Drawings", ["Per product drawings (Phase 2 output)."])
+    # 4. Technical Drawings: per-product PNG when product_drawings provided, else placeholder
+    if product_drawings:
+        drawings_with_png = [d for d in product_drawings if d.get("png_base64")]
+        if drawings_with_png:
+            for idx, d in enumerate(drawings_with_png):
+                _add_drawing_slide(
+                    prs,
+                    d.get("name", f"Product {d.get('product_index', idx)}"),
+                    d["png_base64"],
+                    idx,
+                    len(drawings_with_png),
+                )
+        else:
+            _add_content_slide(prs, "Technical Drawings", ["No drawing images available."])
+    else:
+        _add_content_slide(prs, "Technical Drawings", ["Per product drawings (Phase 2 output)."])
     # 5. Manufacturing Lifecycle (placeholder)
     _add_content_slide(prs, "Manufacturing Lifecycle", [
         "Machining → Carpentry → Metal → Assembly → Upholstery → Paint → Final Assembly → Packaging → Dispatch",
