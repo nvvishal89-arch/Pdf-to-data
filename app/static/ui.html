@@ -18,8 +18,9 @@
     #summary { white-space: pre-wrap; font-size: 0.85rem; color: var(--muted); max-height: 200px; overflow-y: auto; }
     #tableContainer { overflow-x: auto; margin-top: 0.5rem; }
     table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-    th, td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; }
+    th, td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; vertical-align: middle; }
     th { background: var(--border); color: var(--text); }
+    .table-img { max-width: 80px; max-height: 60px; object-fit: contain; background: #0d0e11; border-radius: 4px; display: block; }
     #viewImagesGallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; margin-top: 0.5rem; }
     .viewCard { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
     .viewCard img { width: 100%; height: 140px; object-fit: contain; background: #0d0e11; }
@@ -27,6 +28,8 @@
     .viewCard a { display: block; padding: 0.3rem; font-size: 0.75rem; color: var(--accent); }
     #viewImagesResult { margin-top: 0.5rem; font-size: 0.85rem; color: var(--muted); }
     .error { color: #e07c7c; }
+    .bom-row-not-found { background: #4a2a2a; }
+    .bom-row-fuzzy { background: #4a4a2a; }
   </style>
 </head>
 <body>
@@ -48,6 +51,20 @@
     <button type="button" id="downloadPptBtn">Download PPT</button>
     <button type="button" id="generateSowBtn">Generate SOW</button>
     <button type="button" id="generateViewsBtn">Generate all view images (Front, Side, Top, Isometric)</button>
+    <div style="margin-top: 0.75rem;">
+      <label style="display: inline-flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+        <input type="checkbox" id="useGencad" checked />
+        <span>Use GenCAD (AI 3D → 2D)</span>
+      </label>
+      <input type="text" id="gencadServiceUrl" placeholder="Leave empty = built-in (same server)" autocomplete="off" style="width: 100%; max-width: 28rem; padding: 0.4rem; margin: 0.25rem 0; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text);" />
+      <span style="font-size: 0.8rem; color: var(--muted);">GenCAD URL. Leave empty to use built-in GenCAD on this server (no separate process).</span>
+      <span id="gencadStatus" style="font-size: 0.8rem; color: var(--muted); margin-left: 0.5rem;"></span>
+    </div>
+    <button type="button" id="constructionDrawingsBtn" style="margin-top: 0.5rem;">Generate construction drawings (GenCAD)</button>
+    <span style="font-size: 0.8rem; color: var(--muted); display: block; margin-top: 0.25rem;">Uses parsed dimensions and product data. GenCAD uses AI 3D→2D when service is running; otherwise image vectorization with dimensions on PNG.</span>
+    <div id="constructionDrawingsResult" style="margin-top: 0.5rem; font-size: 0.85rem;"></div>
+    <button type="button" id="generateBomBtn">Generate BOM</button>
+    <div id="bomResult" style="margin-top: 0.5rem;"></div>
     <div id="tableContainer" style="display: none;"></div>
     <div id="viewImagesResult"></div>
     <div id="viewImagesGallery"></div>
@@ -55,8 +72,10 @@
   <div id="error" class="card error" style="display: none;"></div>
 
   <script>
-    const base = window.location.pathname.replace(/\/static\/.*$/, '') || '';
+    const base = window.location.pathname.replace(/\/static\/.*$/, '').replace(/\/$/, '') || '';
+    function getBuiltInGencadUrl() { return window.location.origin + base + '/gencad'; }
     let parsedData = null;
+    let lastViewsResult = null;
 
     async function apiParse(file) {
       const fd = new FormData();
@@ -96,19 +115,76 @@
       return r.json();
     }
 
+    async function apiGencadStatus(url) {
+      const u = (url || '').trim() || null;
+      const q = u ? '?url=' + encodeURIComponent(u) : '';
+      const r = await fetch(base + '/api/gencad/status' + q);
+      if (!r.ok) return { available: false, error: 'Request failed' };
+      return r.json();
+    }
+
+    async function apiDrawingsGenerate(data, productViews, useGencad, gencadServiceUrl) {
+      const body = { data: data, use_vision_dimensions: false };
+      if (productViews && productViews.length) body.product_views = productViews;
+      body.use_gencad = !!useGencad;
+      if ((gencadServiceUrl || '').trim()) body.gencad_service_url = gencadServiceUrl.trim();
+      const r = await fetch(base + '/api/drawings/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }
+
+    async function apiBomGenerate(data, lineOverrides) {
+      const r = await fetch(base + '/api/bom/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: data, line_overrides: lineOverrides || null }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }
+
     function buildTableHtml(data) {
       const p = data.data?.products || [];
       if (!p.length) return '<p>No products</p>';
-      const headers = ['sr_no','name','description','dimensions','qty','unit_price','amount'];
+      const headers = ['image', 'sr_no', 'name', 'description', 'dimensions', 'qty', 'unit_price', 'amount'];
       let html = '<table><thead><tr>' + headers.map(h => '<th>' + h + '</th>').join('') + '</tr></thead><tbody>';
       p.forEach(row => {
         html += '<tr>';
-        headers.forEach(h => html += '<td>' + (row[h] != null ? String(row[h]) : '') + '</td>');
+        headers.forEach(h => {
+          if (h === 'image') {
+            const imgs = row.images || [];
+            const b64 = imgs[0];
+            if (b64) {
+              html += '<td><img class="table-img" src="data:image/png;base64,' + b64 + '" alt=""/></td>';
+            } else {
+              html += '<td>—</td>';
+            }
+          } else {
+            html += '<td>' + (row[h] != null ? escapeHtml(String(row[h])) : '') + '</td>';
+          }
+        });
         html += '</tr>';
       });
       html += '</tbody></table>';
       return html;
     }
+
+    function updateGencadStatus() {
+      const urlEl = document.getElementById('gencadServiceUrl');
+      const isEmpty = !(urlEl && urlEl.value && urlEl.value.trim());
+      const url = isEmpty ? getBuiltInGencadUrl() : urlEl.value.trim();
+      apiGencadStatus(url).then(st => {
+        const el = document.getElementById('gencadStatus');
+        if (st.available) el.textContent = isEmpty ? 'GenCAD: built-in (use GenCAD)' : 'GenCAD: connected';
+        else el.textContent = st.error ? 'GenCAD: ' + st.error : 'GenCAD: not found';
+      }).catch(() => { document.getElementById('gencadStatus').textContent = 'GenCAD: status unavailable'; });
+    }
+    updateGencadStatus();
+    (function() { var el = document.getElementById('gencadServiceUrl'); if (el) el.addEventListener('blur', updateGencadStatus); })();
 
     document.getElementById('parseBtn').addEventListener('click', async () => {
       const input = document.getElementById('pdfFile');
@@ -155,6 +231,82 @@
       }
     });
 
+    document.getElementById('constructionDrawingsBtn').addEventListener('click', async () => {
+      if (!parsedData?.data) return;
+      const btn = document.getElementById('constructionDrawingsBtn');
+      const resultEl = document.getElementById('constructionDrawingsResult');
+      const useGencadEl = document.getElementById('useGencad');
+      const gencadUrlEl = document.getElementById('gencadServiceUrl');
+      btn.disabled = true;
+      resultEl.innerHTML = 'Generating drawings…';
+      try {
+        const useGencad = useGencadEl && useGencadEl.checked;
+        let gencadServiceUrl = (gencadUrlEl && gencadUrlEl.value) ? gencadUrlEl.value.trim() : null;
+        if (useGencad && !gencadServiceUrl) gencadServiceUrl = getBuiltInGencadUrl();
+        let productViews = null;
+        if (lastViewsResult && lastViewsResult.products && lastViewsResult.products.length) {
+          productViews = lastViewsResult.products.map(function(p) {
+            return {
+              product_index: p.product_index,
+              product_name: p.product_name,
+              views: (p.views || []).map(function(v) { return { view_label: v.view_label, image_base64: v.image_base64 }; })
+            };
+          }).filter(function(p) { return p.views && p.views.length; });
+        }
+        const res = await apiDrawingsGenerate(parsedData.data, productViews, useGencad, gencadServiceUrl);
+        const drawings = res.drawings || [];
+        const gencadUsed = res.gencad_used;
+        const gencadStatus = res.gencad_status;
+        let html = '';
+        if (gencadUsed) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">Drawings generated by GenCAD (AI 3D→2D).</p>';
+        else if (useGencad && gencadStatus && !gencadStatus.available) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">GenCAD unavailable (' + (gencadStatus.error || '') + '); used image vectorization.</p>';
+        else if (useGencad && gencadStatus && gencadStatus.available && !gencadUsed) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">GenCAD service connected but inference not configured; used image vectorization.</p>';
+        drawings.forEach((d, i) => {
+          const name = (d.product_name || '') + ' – ' + (d.view_label || 'View');
+          const links = [];
+          if (d.dxf_base64) links.push('<a href="data:application/octet-stream;base64,' + d.dxf_base64 + '" download="' + (name.replace(/\s/g, '_') || 'drawing_' + i) + '.dxf">DXF</a>');
+          if (d.svg_base64) links.push('<a href="data:image/svg+xml;base64,' + d.svg_base64 + '" download="' + (name.replace(/\s/g, '_') || 'drawing_' + i) + '.svg">SVG</a>');
+          if (d.png_base64) links.push('<a href="data:image/png;base64,' + d.png_base64 + '" download="' + (name.replace(/\s/g, '_') || 'drawing_' + i) + '.png">PNG</a>');
+          if (links.length) html += '<div style="margin-bottom: 0.3rem;">' + name + ': ' + links.join(' | ') + '</div>';
+        });
+        resultEl.innerHTML = html || 'No drawings generated.';
+        updateGencadStatus();
+      } catch (e) {
+        resultEl.innerHTML = '<span class="error">' + (e.message || 'Failed') + '</span>';
+      }
+      btn.disabled = false;
+    });
+
+    let lastBom = null;
+    document.getElementById('generateBomBtn').addEventListener('click', async () => {
+      if (!parsedData?.data) return;
+      const btn = document.getElementById('generateBomBtn');
+      const resultEl = document.getElementById('bomResult');
+      btn.disabled = true;
+      resultEl.innerHTML = 'Generating BOM…';
+      try {
+        lastBom = await apiBomGenerate(parsedData.data, null);
+        const lines = lastBom.lines || [];
+        const warnings = lastBom.warnings || [];
+        const projectRef = lastBom.project_ref || 'SQ';
+        let html = '';
+        html += '<p style="font-size:0.9rem;color:var(--muted);margin-bottom:0.5rem;">BOM: <strong style="color:var(--text);">' + escapeHtml(projectRef) + '</strong></p>';
+        if (warnings.length) html += '<p class="error">' + warnings.map(w => escapeHtml(w)).join('<br/>') + '</p>';
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;"><thead><tr><th>Product</th><th>Item</th><th>Qty</th><th>Unit</th><th>Dimensions</th><th>Material</th><th>Status</th><th>Inventory code</th><th>Warning</th></tr></thead><tbody>';
+        lines.forEach(l => {
+          const status = l.match_status || '';
+          const rowClass = status === 'not_found' ? 'bom-row-not-found' : status === 'fuzzy' ? 'bom-row-fuzzy' : '';
+          html += '<tr class="' + rowClass + '"><td>' + escapeHtml(l.product_ref || '') + '</td><td>' + escapeHtml(l.item_code_or_name || '') + '</td><td>' + (l.quantity ?? '') + '</td><td>' + escapeHtml(l.unit || '') + '</td><td>' + escapeHtml(l.dimensions || '') + '</td><td>' + escapeHtml(l.material || '') + '</td><td>' + escapeHtml(status) + '</td><td>' + escapeHtml(l.inventory_code || '—') + '</td><td>' + escapeHtml(l.warning || '') + '</td></tr>';
+        });
+        html += '</tbody></table>';
+        resultEl.innerHTML = html;
+      } catch (e) {
+        resultEl.innerHTML = '<span class="error">' + escapeHtml(e.message || 'Failed') + '</span>';
+      }
+      btn.disabled = false;
+    });
+    function escapeHtml(s) { const div = document.createElement('div'); div.textContent = s; return div.innerHTML; }
+
     document.getElementById('generateSowBtn').addEventListener('click', async () => {
       if (!parsedData?.data) return;
       try {
@@ -180,7 +332,8 @@
       try {
         const openaiKey = document.getElementById('openaiApiKey').value;
         const result = await apiViewsGenerateAll(parsedData.data, openaiKey);
-        resultEl.textContent = result.hint || (result.ai_views_generated ? 'View images generated with DALL·E 3.' : 'No AI views; using references where available.');
+        lastViewsResult = result;
+        resultEl.textContent = result.hint || (result.ai_views_generated ? 'View images generated. Use "Generate construction drawings" to create CAD from these 4 views.' : 'No AI views; using references where available.');
         resultEl.className = result.hint ? 'error' : '';
         (result.products || []).forEach(prod => {
           (prod.views || []).forEach(v => {
@@ -192,7 +345,8 @@
             img.alt = v.view_label;
             const label = document.createElement('div');
             label.className = 'label';
-            label.textContent = (prod.product_name || 'Product ' + prod.product_index) + ' — ' + v.view_label + (v.source ? ' (' + v.source + ')' : '');
+            const sourceLabel = v.source === 'openai_edit' ? 'Image Edit' : v.source === 'replicate' ? 'Replicate' : (v.source === 'openai' ? 'DALL·E 3' : v.source || '');
+            label.textContent = (prod.product_name || 'Product ' + prod.product_index) + ' — ' + v.view_label + (sourceLabel ? ' (' + sourceLabel + ')' : '');
             const link = document.createElement('a');
             link.href = 'data:image/png;base64,' + v.image_base64;
             link.download = (prod.product_name || 'product') + '_' + (v.view_label || 'view').replace(/\s/g, '_') + '.png';

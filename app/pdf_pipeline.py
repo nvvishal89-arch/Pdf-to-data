@@ -19,43 +19,93 @@ from app.template_config import TemplateConfig
 from app.validation import validate_sq_data, _safe_float
 
 
+def _extract_image_bytes(doc, xref) -> Optional[bytes]:
+    """Extract raw image bytes for xref; return None on failure."""
+    try:
+        base_img = doc.extract_image(xref)
+        if base_img:
+            b = base_img.get("image")
+            if b:
+                return b
+    except Exception:
+        pass
+    try:
+        import fitz
+        pix = fitz.Pixmap(doc, xref)
+        if pix.n > 4:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        img_bytes = pix.tobytes(output="png")
+        pix = None
+        return img_bytes
+    except Exception:
+        pass
+    return None
+
+
 def extract_images_from_pdf(pdf_path: str | Path, max_images: int = 50) -> list[str]:
-    """Extract embedded images from PDF as base64 PNG strings; fallback to page renders if none found."""
+    """Extract embedded images from PDF as base64 PNG strings in reading order (top-to-bottom, left-to-right).
+    Uses get_image_info() when available so image order matches the reference table; fallback to page renders if none found."""
     out: list[str] = []
     try:
         import fitz
         doc = fitz.open(pdf_path)
-        # 1) Embedded XObject images via get_images + extract_image
-        for page in doc:
-            for img in page.get_images(full=True):
-                if len(out) >= max_images:
-                    break
-                xref = img[0]
+        # 1) Try position-based order (reading order) so images match S.No. in the table
+        ordered: list[tuple[int, float, float, int]] = []  # (page_no, y0, x0, xref)
+        for page_no, page in enumerate(doc):
+            if len(ordered) >= max_images:
+                break
+            info_list = getattr(page, "get_image_info", None)
+            if info_list and callable(info_list):
                 try:
-                    base_img = doc.extract_image(xref)
-                    if base_img:
-                        b = base_img.get("image")
-                        if b:
-                            out.append(base64.b64encode(b).decode("ascii"))
-                            continue
+                    infos = info_list(xrefs=True)
+                except TypeError:
+                    infos = info_list()
                 except Exception:
-                    pass
-                # Fallback: build Pixmap from xref and export as PNG
-                try:
-                    pix = fitz.Pixmap(doc, xref)
-                    if pix.n > 4:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    img_bytes = pix.tobytes(output="png")
-                    pix = None
-                    if img_bytes:
-                        out.append(base64.b64encode(img_bytes).decode("ascii"))
-                except Exception:
-                    pass
+                    infos = []
+                for info in infos:
+                    xref = info.get("xref") or 0
+                    bbox = info.get("bbox")
+                    if not xref or not bbox:
+                        continue
+                    # bbox is rect-like (x0, y0, x1, y1)
+                    y0 = bbox[1] if len(bbox) > 1 else 0
+                    x0 = bbox[0] if len(bbox) > 0 else 0
+                    ordered.append((page_no, y0, x0, xref))
+            else:
+                # No get_image_info: fall back to get_images in page order
+                for img in page.get_images(full=True):
+                    if len(ordered) >= max_images:
+                        break
+                    ordered.append((page_no, 0, 0, img[0]))
+        # Sort by page, then top-to-bottom (y0), then left-to-right (x0)
+        ordered.sort(key=lambda x: (x[0], x[1], x[2]))
+        seen_xrefs: dict[int, str] = {}  # xref -> base64 to avoid re-extracting same image
+        for _page_no, _y0, _x0, xref in ordered:
             if len(out) >= max_images:
                 break
-        # 2) If no embedded images, render each page to PNG so user still gets visuals
+            if xref in seen_xrefs:
+                out.append(seen_xrefs[xref])
+                continue
+            raw = _extract_image_bytes(doc, xref)
+            if raw:
+                b64 = base64.b64encode(raw).decode("ascii")
+                seen_xrefs[xref] = b64
+                out.append(b64)
+        # 2) If no position-based images, use legacy order (get_images per page)
         if len(out) == 0:
-            for i, page in enumerate(doc):
+            for page in doc:
+                for img in page.get_images(full=True):
+                    if len(out) >= max_images:
+                        break
+                    xref = img[0]
+                    raw = _extract_image_bytes(doc, xref)
+                    if raw:
+                        out.append(base64.b64encode(raw).decode("ascii"))
+                if len(out) >= max_images:
+                    break
+        # 3) If no embedded images, render each page to PNG
+        if len(out) == 0:
+            for page in doc:
                 if len(out) >= max_images:
                     break
                 try:
@@ -158,6 +208,121 @@ def _parse_price_line(line: str) -> tuple[str, str, str]:
     return (unit_price, qty, amount)
 
 
+# Month names for date-like row filter (e.g. "24 January2026")
+_MONTH_YEAR_PATTERN = re.compile(
+    r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s*\d{4}$",
+    re.IGNORECASE,
+)
+
+
+def _is_spurious_row(row: dict[str, str]) -> bool:
+    """Return True if row looks like page/date noise (e.g. sr_no=24, name=January2026)."""
+    name = (row.get("name") or "").strip()
+    sr_no_s = (row.get("sr_no") or "").strip()
+    if not name:
+        return False
+    if _MONTH_YEAR_PATTERN.match(name):
+        return True
+    try:
+        n = int(sr_no_s)
+        if n > 20 and len(name) <= 15 and re.search(r"20\d{2}", name):
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _unmerge_name_cell(rest: str) -> tuple[str, str, str, str, str]:
+    """
+    When the first cell merges name + dimensions + unit_price qty amount (e.g. row 9),
+    extract name, dimensions, unit_price, qty, amount. Returns (name, dimensions, unit_price, qty, amount);
+    dimensions/unit_price/qty/amount may be empty if not present.
+    """
+    name, dimensions, unit_price, qty, amount = "", "", "", "", ""
+    rest = (rest or "").strip()
+    if not rest:
+        return (name, dimensions, unit_price, qty, amount)
+    # Find trailing numeric block: optional ₹/Rs., then numbers like "31200 2" or "312002" and "62400"
+    clean = rest.replace(",", "").replace("\u20b9", "").replace("₹", "")
+    clean = re.sub(r"\bRs\.", " ", clean, flags=re.IGNORECASE)  # avoid ".62400" from "Rs.62,400"
+    nums = re.findall(r"[\d.]+", clean)
+    if len(nums) >= 3:
+        unit_price, qty, amount = nums[-3], nums[-2], nums[-1]
+        last_num_match = list(re.finditer(r"[\d,]+", rest))
+        if len(last_num_match) >= 3:
+            rest = rest[: last_num_match[-3].start()].strip()
+        elif last_num_match:
+            rest = rest[: last_num_match[-1].start()].strip()
+        rest = re.sub(r"\s*[₹\u20b9]?\s*$", "", rest).strip()
+    elif len(nums) == 2:
+        a, b = nums[0], nums[1]
+        try:
+            ai, bi = int(float(a)), int(float(b))
+            if ai > 0 and bi > 0:
+                # Concatenated unit_price + qty (e.g. 312002 = 31200 and 2, amount 62400)
+                if ai > bi and 1 <= (ai % 10) <= 9:
+                    up, q = ai // 10, ai % 10
+                    if up * q == bi:
+                        unit_price, qty, amount = str(up), str(q), str(bi)
+                    else:
+                        unit_price, amount = str(ai), str(bi)
+                        qty = str(round(bi / ai)) if ai and bi % ai == 0 else "1"
+                else:
+                    unit_price, amount = str(ai), str(bi)
+                    qty = str(round(bi / ai)) if ai and bi % ai == 0 else "1"
+            else:
+                unit_price, amount = a, b
+                qty = "1"
+        except (ValueError, ZeroDivisionError):
+            unit_price, amount = a, b
+            qty = "1"
+        last_num_match = list(re.finditer(r"[\d,]+", rest))
+        if len(last_num_match) >= 2:
+            rest = rest[: last_num_match[-2].start()].strip()
+        elif last_num_match:
+            rest = rest[: last_num_match[-1].start()].strip()
+        rest = re.sub(r"\s*[₹\u20b9]?\s*$", "", rest).strip()
+    if " dimensions:" in rest.lower():
+        idx = rest.lower().find(" dimensions:")
+        name = rest[:idx].strip()
+        dimensions = rest[idx + len(" dimensions:"):].strip()
+    else:
+        name = rest.strip()
+    return (name, dimensions, unit_price, qty, amount)
+
+
+def _split_embedded_item_lines(lines: list[str]) -> list[str]:
+    """
+    Split lines that contain an embedded next-item pattern so item 10 (etc.) gets its own line.
+    E.g. "Bar Chair Dimensions: ... 31200 2 62400 10 Kid's Bedroom Bed Base Dimensions: ..."
+    -> ["Bar Chair Dimensions: ... 31200 2 62400", "10 Kid's Bedroom Bed Base Dimensions: ..."]
+    Avoids mixing items 9 and 10 when PDF has no separate row for item 10.
+    """
+    out: list[str] = []
+    # Pattern: space(s) + item number (1-2 digits) + space(s) + name (starts with letter, then letters/apostrophe/spaces)
+    # followed by "Dimensions:" or end or a long number (price). Avoids splitting " 2 ₹62,400" (qty 2).
+    embedded_item_re = re.compile(
+        r"\s+(\d{1,2})\s+([A-Za-z][A-Za-z'\s]{2,}?)(?=\s+Dimensions:|\s+\d{4,}|\s*₹|\s*\u20b9|\s*$)",
+        re.IGNORECASE,
+    )
+    for line in lines:
+        rest = line
+        while rest:
+            m = embedded_item_re.search(rest)
+            if not m:
+                out.append(rest.strip())
+                break
+            # Only split if the number looks like an item number (e.g. 10, 11) not a quantity (often 1-2 digits after price)
+            num = int(m.group(1))
+            before = rest[: m.start()].strip()
+            after = (m.group(1) + " " + m.group(2).strip() + rest[m.end() :].lstrip()).strip()
+            if before:
+                out.append(before)
+            # Continue splitting the "after" part in case it has another embedded item (e.g. 11)
+            rest = after
+    return out
+
+
 def _parse_table_multiline(lines: list[str], header_idx: int) -> list[dict[str, str]]:
     """
     Parse when each product is a multi-line block: first line "1 Name", middle lines specs/description,
@@ -169,20 +334,69 @@ def _parse_table_multiline(lines: list[str], header_idx: int) -> list[dict[str, 
         line = lines[i]
         if re.match(r"^(sub\s*total|total|grand\s*total|tax)", line, re.I):
             break
-        # Product start: line like "1 Stand" or "2 Storage"
+        # Product start: line like "1 Stand" or "2 Storage" or "9 Bar Chair Dimensions: ... 31200 2 ₹62,400"
         m = re.match(r"^\s*(\d+)\s+(.+)$", line)
         if m:
             sr_no = m.group(1)
-            name = _normalize(m.group(2))
-            dimensions = ""
-            description_parts: list[str] = []
-            unit_price, qty, amount = "", "", ""
+            raw_rest = _normalize(m.group(2))
+            # Unmerge when first cell contains Dimensions + price/qty/amount (e.g. row 9)
+            u_name, u_dims, u_price, u_qty, u_amt = _unmerge_name_cell(raw_rest)
+            if u_price or u_qty or u_amt:
+                name = u_name or raw_rest
+                dimensions = u_dims
+                unit_price, qty, amount = u_price, u_qty, u_amt
+            else:
+                name = raw_rest
+                dimensions = ""
+                unit_price, qty, amount = "", "", ""
+            # Skip block if this line is spurious (e.g. "24 January2026"); otherwise we consume the next line ("8 Master Bedroom Coffee Table") and lose item 8
+            tentative = {"sr_no": sr_no, "name": name, "description": "", "dimensions": dimensions, "qty": qty or "1", "unit_price": unit_price, "amount": amount}
+            if _is_spurious_row(tentative):
+                i += 1
+                continue
+            description_parts = [] if (u_price or u_qty or u_amt) else []
             i += 1
-            first_block = len(rows) == 0
             while i < len(lines):
                 ln = lines[i]
                 if re.match(r"^(sub\s*total|total|grand\s*total|tax)", ln, re.I):
                     break
+                # Next item on its own line: "10 Kid's Bedroom Bed Base Dimensions: ..." (avoids mixing 9 and 10)
+                next_m = re.match(r"^\s*(\d+)\s+(.+)$", ln)
+                if next_m and next_m.group(1) != sr_no:
+                    try:
+                        next_num = int(next_m.group(1))
+                        curr_num = int(sr_no)
+                        if next_num == curr_num + 1:
+                            # Flush current row and start next item in same iteration
+                            description = " ".join(description_parts) if description_parts else ""
+                            rows.append({
+                                "sr_no": sr_no,
+                                "name": name,
+                                "description": description,
+                                "dimensions": dimensions,
+                                "area": "",
+                                "material": "",
+                                "finish": "",
+                                "qty": qty or "1",
+                                "unit_price": unit_price,
+                                "amount": amount,
+                            })
+                            sr_no = next_m.group(1)
+                            raw_name = _normalize(next_m.group(2))
+                            # If name cell contains "Dimensions: ...", split so we have a clear name
+                            if " dimensions:" in raw_name.lower():
+                                idx = raw_name.lower().find(" dimensions:")
+                                name = raw_name[:idx].strip()
+                                dimensions = raw_name[idx + len(" dimensions:"):].strip()
+                            else:
+                                name = raw_name
+                                dimensions = ""
+                            description_parts = []
+                            unit_price, qty, amount = "", "", ""
+                            i += 1
+                            continue
+                    except ValueError:
+                        pass
                 # Price line: has ₹ or pattern "num num num" without "X" (e.g. "₹ 7,302 1 ₹7,302" or "36400 2 ?62,400")
                 is_price_line = "\u20b9" in ln or "₹" in ln
                 has_x = " x " in ln.lower() or " × " in ln
@@ -194,7 +408,7 @@ def _parse_table_multiline(lines: list[str], header_idx: int) -> list[dict[str, 
                 alt_price = not is_price_line and len(nums_in_ln) >= 2 and not has_x and (only_nums_regex or mostly_nums)
                 if not is_price_line and has_x:
                     pass  # dimensions line, not price
-                elif is_price_line or alt_price:
+                elif (is_price_line or alt_price) and not unit_price:
                     unit_price, qty, amount = _parse_price_line(ln)
                     i += 1
                     break
@@ -216,7 +430,14 @@ def _parse_table_multiline(lines: list[str], header_idx: int) -> list[dict[str, 
                     else:
                         dimensions = ln_norm
                 else:
-                    description_parts.append(_normalize(ln))
+                    # Populate dimensions from "Dimensions: ..." lines so the column is not empty
+                    if not dimensions and "dimensions:" in ln.lower():
+                        idx = ln.lower().find("dimensions:")
+                        dim_val = _normalize(ln[idx + len("dimensions:"):])
+                        if dim_val:
+                            dimensions = dim_val
+                    else:
+                        description_parts.append(_normalize(ln))
                 i += 1
             description = " ".join(description_parts) if description_parts else ""
             rows.append({
@@ -233,15 +454,17 @@ def _parse_table_multiline(lines: list[str], header_idx: int) -> list[dict[str, 
             })
             continue
         i += 1
-    return rows
+    return [r for r in rows if not _is_spurious_row(r)]
 
 
 def _parse_table_from_text(text: str) -> list[dict[str, str]]:
     """
     Heuristic table extraction. If header suggests multi-line blocks (Specs, Price Qty Amount),
     use block parsing; else one line per row.
+    Splits lines that contain an embedded next-item (e.g. "10 Kid's Bedroom...") so items don't mix.
     """
     lines = [l for l in text.splitlines() if l.strip()]
+    lines = _split_embedded_item_lines(lines)
     header_idx = -1
     header_line = ""
     for i, line in enumerate(lines):
@@ -297,6 +520,9 @@ def _parse_table_from_text(text: str) -> list[dict[str, str]]:
         if row["sr_no"] and not re.match(r"^\d+\.?\d*$", row["sr_no"]):
             skipped_reason.append(f"row{i}:sr_no_non_numeric={repr(row['sr_no'])}")
             continue
+        if _is_spurious_row(row):
+            skipped_reason.append(f"row{i}:spurious={repr(row.get('name','')[:30])}")
+            continue
         rows.append(row)
     return rows
 
@@ -346,10 +572,11 @@ def parse_pdf_to_structured_data(
     )
 
     products: list[Product] = []
-    # When PDF has more images than products (e.g. logo first), skip leading images so row N gets the image that appears in that row.
+    # When num_images > num_products, assume leading images are non-product (e.g. logo) and skip them.
+    # When num_images == num_products, use direct mapping (image i -> product i) so row order matches.
     num_products = len(table_rows)
     num_images = len(extracted_images)
-    image_offset = max(0, num_images - num_products)
+    image_offset = (num_images - num_products) if num_images > num_products else 0
     for i, row in enumerate(table_rows):
         img_idx = image_offset + i
         product_images = [extracted_images[img_idx]] if img_idx < len(extracted_images) else []

@@ -3,12 +3,26 @@ Phase 2: Image -> 2D production drawings (spec §8).
 Pipeline: Image -> Preprocess -> Edge detection -> Vectorization -> Dimensioning -> DXF/SVG/PNG.
 """
 import base64
+import json
 import re
+import time
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+
+# #region agent log
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
+    try:
+        log_path = Path(__file__).resolve().parent.parent / ".cursor" / "debug.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"location": location, "message": message, "data": data, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "hypothesisId": hypothesis_id}) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 
 def _parse_dimensions(dimensions: str) -> list[float]:
@@ -91,6 +105,8 @@ def _image_to_drawing_buffers(
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     paths = _contours_to_svg_paths(contours)
     dims = _parse_dimensions(dimensions)
+    _debug_log("drawing_engine:_image_to_drawing_buffers", "dimensions input and parsed", {"dimensions_str": dimensions, "dims_parsed": dims, "dims_len": len(dims)}, "H1")
+    _debug_log("drawing_engine:_image_to_drawing_buffers", "before _build_png", {"dims_len": len(dims), "has_dims": bool(dims)}, "H2")
     h_img, w_img = edges.shape[:2]
 
     # SVG
@@ -189,6 +205,7 @@ def _build_dxf(
 
 def _build_png(edges: np.ndarray, dims: list[float], title: str) -> Optional[bytes]:
     """Build PNG: white background, black lines, dimension lines and title block (proper technical line drawing)."""
+    _debug_log("drawing_engine:_build_png", "entry", {"dims_len": len(dims), "dims": dims[:5] if dims else [], "will_draw_dims": bool(dims)}, "H3")
     try:
         h, w = edges.shape[:2]
         # Engineering style: white background, black lines
@@ -253,6 +270,61 @@ def generate_drawings(
     }
 
 
+def generate_drawings_from_product_views(
+    product_views: list[dict],
+    data: Optional["SQStructuredData"] = None,
+    use_vision_dimensions: bool = False,
+) -> list[dict]:
+    """
+    Generate CAD drawings (SVG, DXF, PNG) from AI-generated view images.
+    product_views: list of { product_index, product_name, views: [ { view_label, image_base64 } ] }.
+    When data is provided, dimensions come from data.products[product_index].
+    Returns list of dicts: product_index, product_name, view_label, dimensions, svg_base64, dxf_base64, png_base64.
+    """
+    results = []
+    for pv in product_views:
+        product_index = pv.get("product_index", 0)
+        product_name = (pv.get("product_name") or "").strip() or f"Product {product_index + 1}"
+        views = pv.get("views") or []
+        dims_str = ""
+        if data and 0 <= product_index < len(data.products):
+            prod = data.products[product_index]
+            dims_str = getattr(prod, "dimensions", None) or ""
+            # Fallback: if no dimensions field, try description/name for dimension-like text (e.g. "1800 X 900" or "7' Width")
+            if not dims_str or not dims_str.strip():
+                desc = getattr(prod, "description", None) or ""
+                name = getattr(prod, "name", None) or ""
+                for candidate in (desc, name):
+                    if candidate and _parse_dimensions(candidate):
+                        dims_str = candidate
+                        break
+        _debug_log("drawing_engine:generate_drawings_from_product_views", "dims_str for product", {"product_index": product_index, "dims_str": dims_str, "dims_str_len": len(dims_str)}, "H4")
+        for v in views:
+            view_label = (v.get("view_label") or "").strip() or "View"
+            img_b64 = v.get("image_base64")
+            if not img_b64:
+                continue
+            title = f"{product_name} | {view_label}" if product_name else view_label
+            out = generate_drawings(
+                img_b64,
+                dimensions=dims_str,
+                name=title,
+                use_vision_dimensions=use_vision_dimensions,
+            )
+            results.append({
+                "product_index": product_index,
+                "product_name": product_name,
+                "name": product_name or view_label,
+                "image_index": -1,
+                "view_label": view_label,
+                "dimensions": dims_str,
+                "svg_base64": out.get("svg_base64"),
+                "dxf_base64": out.get("dxf_base64"),
+                "png_base64": out.get("png_base64"),
+            })
+    return results
+
+
 def generate_drawings_for_data(
     data: "SQStructuredData",
     use_vision_dimensions: bool = False,
@@ -270,6 +342,14 @@ def generate_drawings_for_data(
         images = getattr(product, "images", None) or []
         image_views = getattr(product, "image_views", None) or []
         dims_str = getattr(product, "dimensions", None) or ""
+        # Fallback: if no dimensions, try description/name for dimension-like text
+        if not dims_str or not dims_str.strip():
+            desc = getattr(product, "description", None) or ""
+            pname = getattr(product, "name", None) or ""
+            for candidate in (desc, pname):
+                if candidate and _parse_dimensions(candidate):
+                    dims_str = candidate
+                    break
         name = getattr(product, "name", None) or ""
 
         if not images and not generate_missing_views:
