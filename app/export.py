@@ -31,6 +31,7 @@ def export_csv(data: SQStructuredData, path: str | Path | None = None) -> str:
             "qty",
             "unit_price",
             "amount",
+            "remarks",
         ]
     )
     for p in data.products:
@@ -46,6 +47,7 @@ def export_csv(data: SQStructuredData, path: str | Path | None = None) -> str:
                 p.qty,
                 p.unit_price,
                 p.amount,
+                p.remarks,
             ]
         )
     out = buffer.getvalue()
@@ -93,6 +95,7 @@ def export_excel(data: SQStructuredData, path: str | Path) -> None:
         "Qty",
         "Rate",
         "Amount",
+        "Remarks",
     ]
     for c, col in enumerate(cols):
         ws.write(row, c, col, header)
@@ -107,6 +110,7 @@ def export_excel(data: SQStructuredData, path: str | Path) -> None:
         ws.write(row, 6, p.qty)
         ws.write(row, 7, p.unit_price)
         ws.write(row, 8, p.amount)
+        ws.write(row, 9, p.remarks)
         row += 1
     row += 1
     s = data.summary

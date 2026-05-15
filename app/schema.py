@@ -50,6 +50,7 @@ class Product(BaseModel):
     qty: int = 1
     unit_price: float = 0.0
     amount: float = 0.0
+    remarks: str = ""
     images: list[str] = Field(default_factory=list)
     image_views: list[str] = Field(default_factory=list, description="View label per image (Front View, Side View, etc.)")
 
@@ -68,7 +69,7 @@ class Product(BaseModel):
     def _float_coerce(cls, v: Any) -> float:
         return float(_num(v, 0.0))
 
-    @field_validator("name", "description", "dimensions", "area", "material", "finish", mode="before")
+    @field_validator("name", "description", "dimensions", "area", "material", "finish", "remarks", mode="before")
     @classmethod
     def _str_default(cls, v: Any) -> str:
         return "" if v is None else str(v)

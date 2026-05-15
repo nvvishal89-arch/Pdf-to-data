@@ -6,14 +6,14 @@ import json
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Form
 from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
 from app.schema import SQStructuredData, ParseResult
-from app.pdf_pipeline import parse_pdf_with_validation
+from app.pdf_pipeline import parse_pdf_with_validation, merge_sq_data
 from app.export import export_json
 from app.ppt_generator import generate_ppt
 from app.sow_generator import generate_sow
@@ -58,13 +58,13 @@ _agent_log("main.py:startup", "Static mount", {"static_dir": str(STATIC_DIR), "s
 @app.get("/")
 async def root():
     """Redirect to UI."""
-    return RedirectResponse(url="/static/ui.html", status_code=302)
+    return RedirectResponse(url="static/ui.html", status_code=302)
 
 
 @app.get("/ui")
 async def ui_redirect():
     """Redirect /ui to the static UI (common bookmark/link)."""
-    return RedirectResponse(url="/static/ui.html", status_code=302)
+    return RedirectResponse(url="static/ui.html", status_code=302)
 
 
 @app.post("/api/parse")
@@ -80,6 +80,33 @@ async def api_parse(file: UploadFile = File(...)):
         try:
             data, errors = parse_pdf_with_validation(tmp_path)
             return ParseResult(data=data, validation_errors=errors)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/parse-append")
+async def api_parse_append(
+    file: UploadFile = File(...),
+    data: str = Form(default="{}"),
+):
+    """Parse the uploaded PDF and append its products to existing data. Body: form field 'data' (JSON SQStructuredData); file: next PDF. Returns merged ParseResult."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file.")
+    try:
+        existing = SQStructuredData.model_validate_json(data) if data and data.strip() else SQStructuredData()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid data JSON: {e}")
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            new_data, errors = parse_pdf_with_validation(tmp_path)
+            merged = merge_sq_data(existing, new_data)
+            return ParseResult(data=merged, validation_errors=errors)
         finally:
             Path(tmp_path).unlink(missing_ok=True)
     except Exception as e:
@@ -144,19 +171,6 @@ def _resolve_gencad_url(gencad_service_url: str | None, use_gencad: bool = False
     return None
 
 
-# #region agent log
-def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
-    try:
-        import json, os, time
-        log_path = Path(__file__).resolve().parent.parent / ".cursor" / "debug.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"location": location, "message": message, "data": data, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "hypothesisId": hypothesis_id}) + "\n")
-    except Exception:
-        pass
-# #endregion
-
-
 @app.post("/api/drawings/generate")
 async def api_drawings_generate(
     data: SQStructuredData = Body(..., embed=False),
@@ -167,7 +181,6 @@ async def api_drawings_generate(
 ):
     """Generate 2D drawings (PNG, DXF, SVG) via GenCAD when use_gencad=True (uses parsed dimensions); else image vectorization. product_views: optional AI-generated view images."""
     gencad_url = _resolve_gencad_url(gencad_service_url, use_gencad=use_gencad)
-    _debug_log("main.py:drawings", "gencad URL resolution", {"use_gencad": use_gencad, "gencad_service_url_in": gencad_service_url, "gencad_url_resolved": gencad_url}, "H3a")
     gencad_status = get_gencad_service_status(gencad_url) if gencad_url else {"available": False, "error": "No GenCAD URL"}
     results = None
     gencad_used = False
@@ -209,6 +222,8 @@ async def api_drawings_generate(
                     ]
             except Exception as e:
                 _agent_log("main.py:gencad", "GenCAD fallback", {"error": str(e)})
+                if "not configured" in str(e).lower() or "501" in str(e):
+                    gencad_status = {**gencad_status, "inference_ready": False, "inference_error": str(e)}
 
     if results is None:
         if product_views:

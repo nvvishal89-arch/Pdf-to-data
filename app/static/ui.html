@@ -35,9 +35,16 @@
 <body>
   <h1>ERP SQ Intelligence Engine</h1>
   <div class="card">
-    <label>Upload SQ PDF</label>
-    <input type="file" id="pdfFile" accept=".pdf" />
+    <label>Upload SQ PDF(s)</label>
+    <span style="font-size: 0.8rem; color: var(--muted); display: block; margin-bottom: 0.25rem;">Select one or more PDFs; products from all files are merged in order (sr_no 1, 2, 3, …).</span>
+    <input type="file" id="pdfFile" accept=".pdf" multiple />
     <button type="button" id="parseBtn">Parse PDF</button>
+  </div>
+  <div class="card" id="addPdfCard" style="display: none;">
+    <label>Add another PDF</label>
+    <span style="font-size: 0.8rem; color: var(--muted); display: block; margin-bottom: 0.25rem;">Append products from the next PDF to the current list (sr_no continues).</span>
+    <input type="file" id="addPdfFile" accept=".pdf" />
+    <button type="button" id="addPdfBtn">Add PDF</button>
   </div>
   <div class="card">
     <label for="openaiApiKey">OpenAI API key (for DALL·E 3 view generation)</label>
@@ -81,6 +88,15 @@
       const fd = new FormData();
       fd.append('file', file);
       const r = await fetch(base + '/api/parse', { method: 'POST', body: fd });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }
+
+    async function apiParseAppend(existingData, file) {
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('data', JSON.stringify(existingData));
+      const r = await fetch(base + '/api/parse-append', { method: 'POST', body: fd });
       if (!r.ok) throw new Error(await r.text());
       return r.json();
     }
@@ -190,23 +206,57 @@
       const input = document.getElementById('pdfFile');
       const errEl = document.getElementById('error');
       const after = document.getElementById('afterParse');
+      const btn = document.getElementById('parseBtn');
       errEl.style.display = 'none';
-      if (!input.files?.length) { errEl.textContent = 'Select a PDF file.'; errEl.style.display = 'block'; return; }
+      if (!input.files?.length) { errEl.textContent = 'Select one or more PDF files.'; errEl.style.display = 'block'; return; }
+      const files = Array.from(input.files);
+      btn.disabled = true;
       try {
-        const result = await apiParse(input.files[0]);
+        let result = await apiParse(files[0]);
+        for (let i = 1; i < files.length; i++) {
+          result = await apiParseAppend(result.data, files[i]);
+        }
         parsedData = result;
         document.getElementById('summary').textContent = result.data?.project ? [
           'Project: ' + (result.data.project.project_name || '—'),
           'Client: ' + (result.data.project.client_name || '—'),
-          'Products: ' + (result.data.products?.length || 0),
+          'Products: ' + (result.data.products?.length || 0) + (files.length > 1 ? ' (' + files.length + ' PDFs merged)' : ''),
         ].join('\n') : JSON.stringify(result.data);
         after.style.display = 'block';
+        document.getElementById('addPdfCard').style.display = 'block';
         document.getElementById('viewImagesGallery').innerHTML = '';
         document.getElementById('viewImagesResult').textContent = '';
       } catch (e) {
         errEl.textContent = e.message || 'Parse failed';
         errEl.style.display = 'block';
       }
+      btn.disabled = false;
+    });
+
+    document.getElementById('addPdfBtn').addEventListener('click', async () => {
+      const input = document.getElementById('addPdfFile');
+      const errEl = document.getElementById('error');
+      if (!parsedData?.data) { errEl.textContent = 'Parse a PDF first, then add another.'; errEl.style.display = 'block'; return; }
+      if (!input.files?.length) { errEl.textContent = 'Select a PDF file to add.'; errEl.style.display = 'block'; return; }
+      errEl.style.display = 'none';
+      const btn = document.getElementById('addPdfBtn');
+      btn.disabled = true;
+      try {
+        const result = await apiParseAppend(parsedData.data, input.files[0]);
+        parsedData = result;
+        document.getElementById('summary').textContent = result.data?.project ? [
+          'Project: ' + (result.data.project.project_name || '—'),
+          'Client: ' + (result.data.project.client_name || '—'),
+          'Products: ' + (result.data.products?.length || 0),
+        ].join('\n') : JSON.stringify(result.data);
+        const container = document.getElementById('tableContainer');
+        if (container.style.display !== 'none') container.innerHTML = buildTableHtml(parsedData);
+        input.value = '';
+      } catch (e) {
+        errEl.textContent = e.message || 'Add PDF failed';
+        errEl.style.display = 'block';
+      }
+      btn.disabled = false;
     });
 
     document.getElementById('viewTableBtn').addEventListener('click', () => {
@@ -259,8 +309,12 @@
         const gencadStatus = res.gencad_status;
         let html = '';
         if (gencadUsed) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">Drawings generated by GenCAD (AI 3D→2D).</p>';
-        else if (useGencad && gencadStatus && !gencadStatus.available) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">GenCAD unavailable (' + (gencadStatus.error || '') + '); used image vectorization.</p>';
-        else if (useGencad && gencadStatus && gencadStatus.available && !gencadUsed) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">GenCAD service connected but inference not configured; used image vectorization.</p>';
+        else if (useGencad && gencadStatus && !gencadStatus.available) html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">GenCAD unavailable (' + escapeHtml(gencadStatus.error || '') + '); used image vectorization.</p>';
+        else if (useGencad && gencadStatus && gencadStatus.available && !gencadUsed) {
+          var raw = (gencadStatus.inference_error && gencadStatus.inference_error.length) ? gencadStatus.inference_error : 'GenCAD service connected but inference not configured; used image vectorization.';
+          var msg = escapeHtml(raw).replace(/(https?:\/\/[^<\s]+)/g, function(u) { return '<a href="' + escapeHtml(u) + '" target="_blank" rel="noopener" style="color:var(--accent,inherit);">' + u + '</a>'; });
+          html += '<p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.5rem;">' + msg + ' <span style="color:var(--muted);">Used image vectorization.</span></p>';
+        }
         drawings.forEach((d, i) => {
           const name = (d.product_name || '') + ' – ' + (d.view_label || 'View');
           const links = [];

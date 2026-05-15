@@ -40,6 +40,16 @@
       "col_index": 6
     },
     {
+      "header": "specs.",
+      "key": "dimensions",
+      "col_index": 7
+    },
+    {
+      "header": "price",
+      "key": "unit_price",
+      "col_index": 8
+    },
+    {
       "header": "qty",
       "key": "qty",
       "col_index": 9
@@ -48,6 +58,11 @@
       "header": "amount",
       "key": "amount",
       "col_index": 10
+    },
+    {
+      "header": "remarks",
+      "key": "remarks",
+      "col_index": 11
     }
   ],
   "data_start_row": 13,
